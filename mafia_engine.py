@@ -149,7 +149,7 @@ class LLMChatDelta:
     break matrix ranges.
     """
 
-    reasoning_chain: list[str]
+    reasoning_chain: str
     d_suspicion: dict[PlayerId, float]
     d_empathy: dict[PlayerId, float]
     stress_impact: float
@@ -289,84 +289,115 @@ class EventCodex:
 
 
 class LlamaJSONEvaluator:
-    """Mockable llama-cpp-python adapter for slow-path chat evaluation.
+    """llama-cpp-python slow-path evaluator for public chat psychology.
 
-    Pass a real `llama_cpp.Llama` object as `llm` in production. In tests and
-    offline development, leave it as None to use a deterministic lexical
-    fallback with the same output schema.
+    The evaluator owns local Qwen inference, validates JSON-shaped output, and
+    returns only bounded matrix deltas. It intentionally has no API for role
+    actions, votes, deaths, reveals, or win conditions. Tests may pass a fake
+    `llm` object with a compatible `create_chat_completion` method.
     """
 
+    MODEL_PATH = "./qwen2.5-3b-instruct-q4_k_m.gguf"
     JSON_SCHEMA: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "reasoning_chain": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+            "reasoning_chain": {"type": "string"},
             "d_suspicion": {"type": "object", "additionalProperties": {"type": "number"}},
             "d_empathy": {"type": "object", "additionalProperties": {"type": "number"}},
             "stress_impact": {"type": "number"},
         },
         "required": ["reasoning_chain", "d_suspicion", "d_empathy", "stress_impact"],
-        "additionalProperties": False,
     }
 
-    def __init__(self, llm: Any | None = None) -> None:
-        self.llm = llm
+    SYSTEM_PROMPT = (
+        "[SYSTEM] You are the Slow Path psychological evaluator for a Mafia "
+        "social deduction game. Evaluate only the psychological impact of the "
+        "speaker's public text on listeners. Return strict JSON matching the "
+        "provided schema. Use player-id keys such as '1' or '7'. Values in "
+        "d_suspicion, d_empathy, and stress_impact MUST be between -0.5 and "
+        "0.5. Positive d_suspicion means listeners become more suspicious of "
+        "that target. Positive d_empathy means listeners become more sympathetic "
+        "to that target. You must never decide votes, night actions, deaths, "
+        "role reveals, healing, investigations, or win conditions."
+    )
+
+    def __init__(self, llm: Any | None = None, model_path: str = MODEL_PATH) -> None:
+        if llm is not None:
+            self.llm = llm
+            return
+
+        from llama_cpp import Llama
+
+        self.llm = Llama(
+            model_path=model_path,
+            n_gpu_layers=-1,
+            n_ctx=4096,
+            verbose=False,
+        )
 
     async def evaluate_chat_message(self, speaker_id: PlayerId, text: str, listeners_context: Mapping[str, Any]) -> LLMChatDelta:
-        """Return bounded deltas inferred from chat text.
-
-        The production branch uses llama-cpp-python's JSON-schema response
-        format. The model sees only local listener context and public text; it
-        does not receive hidden roles, living counts, or global matrices.
-        """
-
-        if self.llm is None:
-            return self._mock_evaluate(speaker_id, text, listeners_context)
+        """Infer bounded psychological deltas from one public chat message."""
 
         prompt = self._build_prompt(speaker_id, text, listeners_context)
         raw = await asyncio.to_thread(
             self.llm.create_chat_completion,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
             response_format={"type": "json_object", "schema": self.JSON_SCHEMA},
             temperature=0.1,
         )
         content = raw["choices"][0]["message"]["content"]
         return self._parse_delta(content)
 
-    def _mock_evaluate(self, speaker_id: PlayerId, text: str, listeners_context: Mapping[str, Any]) -> LLMChatDelta:
-        lower = text.lower()
-        mentioned_ids = [int(token[1:]) for token in lower.replace(",", " ").split() if token.startswith("p") and token[1:].isdigit()]
-        if not mentioned_ids:
-            mentioned_ids = list(listeners_context.get("alive_target_ids", []))[:1]
+    async def generate_bot_chat(self, bot: MafiaBot, public_context: Mapping[str, Any]) -> str:
+        """Generate one short, non-authoritative bot utterance for the CLI."""
 
-        accusation_words = {"sus", "suspicious", "kill", "killer", "mafia", "vote", "винов", "маф", "убить"}
-        defense_words = {"trust", "innocent", "heal", "safe", "верю", "мир", "леч"}
-        acc_score = 0.08 if any(word in lower for word in accusation_words) else 0.0
-        def_score = 0.07 if any(word in lower for word in defense_words) else 0.0
-        stress = clamp(0.02 + acc_score - (def_score / 2), -0.1, 0.2)
-        return LLMChatDelta(
-            reasoning_chain=["mock lexical evaluator", "bounded deltas only"],
-            d_suspicion={target_id: acc_score - def_score for target_id in mentioned_ids},
-            d_empathy={target_id: def_score - (acc_score / 2) for target_id in mentioned_ids},
-            stress_impact=stress,
+        prompt = (
+            "Write one short in-character public Mafia chat sentence for this bot. "
+            "Do not reveal hidden roles. Do not choose a final vote. The sentence "
+            "may defend, accuse, or express uncertainty based only on public context.\n"
+            f"Bot: P{bot.bot_id}; stress={bot.stress_level:.2f}; public_context="
+            f"{json.dumps(public_context, ensure_ascii=False)}"
         )
+        raw = await asyncio.to_thread(
+            self.llm.create_chat_completion,
+            messages=[
+                {"role": "system", "content": "[SYSTEM] Generate flavor chat only. Never decide game actions."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=48,
+        )
+        return str(raw["choices"][0]["message"]["content"]).strip().replace("\n", " ")[:180]
 
     def _build_prompt(self, speaker_id: PlayerId, text: str, listeners_context: Mapping[str, Any]) -> str:
         return (
-            "Evaluate this Mafia chat message into numeric deltas only. "
-            "Do not decide actions, deaths, roles, or votes. Return strict JSON.\n"
+            "Evaluate the public chat message below into numeric deltas only.\n"
             f"Speaker: P{speaker_id}\n"
             f"Public text: {text!r}\n"
-            f"Listener-local context: {json.dumps(listeners_context, ensure_ascii=False)}"
+            "Listener-local context JSON, containing only public/allowed fields: "
+            f"{json.dumps(listeners_context, ensure_ascii=False)}"
         )
 
     def _parse_delta(self, content: str) -> LLMChatDelta:
         payload = json.loads(content)
         return LLMChatDelta(
-            reasoning_chain=[str(item)[:160] for item in payload.get("reasoning_chain", [])[:4]],
-            d_suspicion={int(key): clamp(float(value), -0.25, 0.25) for key, value in payload.get("d_suspicion", {}).items()},
-            d_empathy={int(key): clamp(float(value), -0.25, 0.25) for key, value in payload.get("d_empathy", {}).items()},
-            stress_impact=clamp(float(payload.get("stress_impact", 0.0)), -0.2, 0.2),
+            reasoning_chain=str(payload.get("reasoning_chain", ""))[:500],
+            d_suspicion=self._parse_delta_map(payload.get("d_suspicion", {})),
+            d_empathy=self._parse_delta_map(payload.get("d_empathy", {})),
+            stress_impact=clamp(float(payload.get("stress_impact", 0.0)), -0.5, 0.5),
         )
+
+    def _parse_delta_map(self, raw_map: Mapping[str, Any]) -> dict[PlayerId, float]:
+        parsed: dict[PlayerId, float] = {}
+        for raw_key, raw_value in raw_map.items():
+            key = str(raw_key).strip().removeprefix("P").removeprefix("p")
+            if not key.isdigit():
+                continue
+            parsed[int(key)] = clamp(float(raw_value), -0.5, 0.5)
+        return parsed
 
 
 class NeurosymbolicRouter:
@@ -377,6 +408,24 @@ class NeurosymbolicRouter:
         self.codex = EventCodex()
         self.evaluator = evaluator or LlamaJSONEvaluator()
         self._chat_queue: asyncio.Queue[ChatMessage] = asyncio.Queue()
+        self.last_night_resolution: NightResolution | None = None
+        self.last_day_votes: dict[PlayerId, PlayerId] = {}
+
+    def queue_night_actions(self) -> NightResolution:
+        """Resolve the deterministic night queue and store it for morning UI/CLI.
+
+        This wrapper exists for integrations that treat night as queued role
+        actions followed by a separate morning report. It delegates to the
+        existing fast-path resolver and does not alter the underlying math.
+        """
+
+        self.last_night_resolution = self.resolve_night_phase()
+        return self.last_night_resolution
+
+    def apply_morning_report(self) -> NightResolution | None:
+        """Return the latest resolved night summary for presentation layers."""
+
+        return self.last_night_resolution
 
     async def enqueue_chat(self, speaker_id: PlayerId, text: str, visible_to: Iterable[PlayerId] | None = None) -> None:
         audience = tuple(visible_to or self.state.alive_ids(exclude=speaker_id))
@@ -469,7 +518,7 @@ class NeurosymbolicRouter:
             self.codex.apply(self.state, EventType.DOC_HEAL, actor_id=self._first_alive_role_id(Role.DOC), target_id=resolution.doc_target)
 
         attempted_kills = [target for target in [resolution.mafia_target, resolution.maniac_target] if target is not None]
-        for target_id, count in Counter(attempted_kills).items():
+        for target_id in Counter(attempted_kills):
             if target_id == resolution.doc_target:
                 self.state.event_log.append(f"Player {target_id} survived due to doctor protection")
                 continue
@@ -496,6 +545,7 @@ class NeurosymbolicRouter:
                 votes[voter.bot_id] = target
                 self.codex.apply(self.state, EventType.VOTE_AGAINST, actor_id=voter.bot_id, target_id=target)
 
+        self.last_day_votes = votes.copy()
         if not votes:
             self.state.event_log.append("Day ended with no valid votes")
             self.state.day_index += 1
