@@ -7,6 +7,7 @@ from mafia_engine import (
     LLMChatDelta,
     LlamaJSONEvaluator,
     NeurosymbolicRouter,
+    load_bot_profiles,
     Phase,
     Role,
     Team,
@@ -93,6 +94,28 @@ class MafiaEngineTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+
+
+    def test_profiles_json_loads_persistent_identities(self) -> None:
+        profiles = load_bot_profiles()
+        self.assertGreaterEqual(len(profiles), 10)
+        first = next(iter(profiles.values()))
+        self.assertIn("name", first)
+        self.assertIn("avatar_base", first)
+        self.assertIn("psychotype", first)
+
+    def test_mafia_chat_channel_only_updates_mafia_listeners(self) -> None:
+        async def scenario() -> None:
+            state = build_demo_state(seed=24)
+            router = NeurosymbolicRouter(state, evaluator=FakeEvaluator())
+            mafia_before = state.bots[2].suspicion_matrix[1]
+            town_before = state.bots[4].suspicion_matrix[1]
+            await router.enqueue_chat(1, "private plan", channel="mafia")
+            await router.process_chat_batch()
+            self.assertGreater(state.bots[2].suspicion_matrix[1], mafia_before)
+            self.assertEqual(state.bots[4].suspicion_matrix[1], town_before)
+
+        asyncio.run(scenario())
 
     def test_trial_phase_exiles_only_when_guilty_majority(self) -> None:
         state = build_demo_state(seed=21)

@@ -24,10 +24,12 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, MutableMapping, Sequence
 
 PlayerId = int
 Gender = Literal["male", "female"]
+ChatChannel = Literal["general", "mafia"]
 
 MIN_PLAYERS = 8
 MAX_PLAYERS = 12
@@ -108,6 +110,8 @@ class MafiaBot:
     gender: Gender
     role: Role
     psychotype: Psychotype
+    display_name: str = ""
+    avatar_base: str = ""
     suspicion_matrix: dict[PlayerId, float] = field(default_factory=dict)
     empathy_matrix: dict[PlayerId, float] = field(default_factory=dict)
     stress_level: float = 0.0
@@ -119,6 +123,8 @@ class MafiaBot:
     def __post_init__(self) -> None:
         if self.gender not in {"male", "female"}:
             raise ValueError(f"Unsupported gender: {self.gender!r}")
+        self.display_name = self.display_name or f"P{self.bot_id}"
+        self.avatar_base = self.avatar_base or f"default_{self.gender}"
         self.avatar_state = self.avatar_state or f"default_{self.gender}"
 
     @property
@@ -144,6 +150,7 @@ class ChatMessage:
     speaker_id: PlayerId
     text: str
     visible_to: tuple[PlayerId, ...]
+    channel: ChatChannel = "general"
 
 
 @dataclass(slots=True)
@@ -205,6 +212,26 @@ class GameState:
 
     def by_role(self, role: Role) -> list[MafiaBot]:
         return [bot for bot in self.alive_bots() if bot.role is role]
+
+
+def load_bot_profiles(profile_path: str | Path = "profiles.json") -> dict[str, dict[str, Any]]:
+    """Load persistent bot identities and psychotypes from profiles.json."""
+
+    path = Path(profile_path)
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("profiles.json must contain an object keyed by profile id")
+    return payload
+
+
+def sampled_bot_profiles(rng: random.Random, count: int = 7, profile_path: str | Path = "profiles.json") -> list[dict[str, Any]]:
+    """Return stable profile records sampled without replacement for one game."""
+
+    profiles = list(load_bot_profiles(profile_path).values())
+    if len(profiles) < count:
+        raise ValueError(f"Need at least {count} profiles in {profile_path}")
+    return rng.sample(profiles, count)
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -451,6 +478,7 @@ class NeurosymbolicRouter:
         self.last_day_votes: dict[PlayerId, PlayerId] = {}
         self.last_trial_votes: dict[PlayerId, str] = {}
         self.intent_to_kill: tuple[PlayerId, float] | None = None
+        self.kill_intents: dict[PlayerId, PlayerId] = {}
 
     def queue_night_actions(self) -> NightResolution:
         """Resolve the deterministic night queue and store it for morning UI/CLI.
@@ -468,18 +496,36 @@ class NeurosymbolicRouter:
 
         return self.last_night_resolution
 
-    def set_intent_to_kill(self, target_id: PlayerId, timestamp: float) -> None:
-        """Store the human Mafia kill intent for bot-Mafia coordination."""
+    def set_intent_to_kill(self, target_id: PlayerId, timestamp: float, actor_id: PlayerId = 1) -> None:
+        """Store a Mafia kill intent; Player 1's intent leads bot-Mafia consensus."""
 
         if target_id in self.state.bots and self.state.bots[target_id].is_alive:
-            self.intent_to_kill = (target_id, timestamp)
+            self.kill_intents[actor_id] = target_id
+            if actor_id == 1:
+                self.intent_to_kill = (target_id, timestamp)
 
     def clear_intent_to_kill(self) -> None:
         self.intent_to_kill = None
+        self.kill_intents.clear()
 
-    async def enqueue_chat(self, speaker_id: PlayerId, text: str, visible_to: Iterable[PlayerId] | None = None) -> None:
-        audience = tuple(visible_to or self.state.alive_ids(exclude=speaker_id))
-        await self._chat_queue.put(ChatMessage(speaker_id=speaker_id, text=text, visible_to=audience))
+    def _mafia_chat_audience(self, speaker_id: PlayerId) -> tuple[PlayerId, ...]:
+        speaker = self.state.bots.get(speaker_id)
+        if speaker is None or speaker.team is not Team.MAFIA or not speaker.is_alive:
+            return tuple()
+        return tuple(bot.bot_id for bot in self.state.alive_bots() if bot.team is Team.MAFIA and bot.bot_id != speaker_id)
+
+    async def enqueue_chat(
+        self,
+        speaker_id: PlayerId,
+        text: str,
+        visible_to: Iterable[PlayerId] | None = None,
+        channel: ChatChannel = "general",
+    ) -> None:
+        if channel == "mafia":
+            audience = self._mafia_chat_audience(speaker_id)
+        else:
+            audience = tuple(visible_to or self.state.alive_ids(exclude=speaker_id))
+        await self._chat_queue.put(ChatMessage(speaker_id=speaker_id, text=text, visible_to=audience, channel=channel))
 
     async def process_chat_batch(self, max_batch_size: int = 8) -> None:
         """Drain queued chat messages and apply LLM deltas via credibility."""
@@ -494,7 +540,7 @@ class NeurosymbolicRouter:
         await asyncio.gather(*tasks)
 
     async def _evaluate_one_message(self, message: ChatMessage) -> None:
-        context = {"speaker_id": message.speaker_id, "alive_target_ids": self.state.alive_ids(exclude=message.speaker_id)}
+        context = {"speaker_id": message.speaker_id, "alive_target_ids": list(message.visible_to), "channel": message.channel}
         delta = await self.evaluator.evaluate_chat_message(message.speaker_id, message.text, context)
         self._apply_chat_delta(message, delta)
 
@@ -511,7 +557,7 @@ class NeurosymbolicRouter:
                 if target_id in self.state.bots and target_id != listener_id:
                     add_clamped(listener.empathy_matrix, target_id, raw_delta * credibility, -1.0, 1.0)
             listener.stress_level = clamp(listener.stress_level + abs(credibility) * delta.stress_impact, 0.0, 1.0)
-        self.state.event_log.append(f"LLM deltas applied for speaker {message.speaker_id}")
+        self.state.event_log.append(f"LLM deltas applied for speaker {message.speaker_id} in {message.channel} chat")
 
     def _credibility_index(self, listener: MafiaBot, speaker_id: PlayerId) -> float:
         """Map trust to [-1, 1]; distrust inverts model deltas."""
@@ -613,10 +659,62 @@ class NeurosymbolicRouter:
         counts = Counter(votes.values())
         top_count = max(counts.values())
         tied = [target_id for target_id, count in counts.items() if count == top_count]
-        exiled = self.state.rng.choice(tied)
-        self.codex.apply(self.state, EventType.DAY_EXILE, target_id=exiled)
+        self.state.trial_target = self.state.rng.choice(tied)
+        self.state.event_log.append(f"Player {self.state.trial_target} is on trial")
+        return self.state.trial_target
+
+    def resolve_trial_phase(self, external_votes: Mapping[PlayerId, str] | None = None) -> PlayerId | None:
+        """Resolve guilty/innocent votes for the current trial target."""
+
+        target_id = self.state.trial_target
+        if target_id is None or target_id not in self.state.bots or not self.state.bots[target_id].is_alive:
+            self.last_trial_votes = {}
+            self.state.day_index += 1
+            self.state.trial_target = None
+            self.state.event_log.append("Trial skipped because there was no valid target")
+            return None
+
+        votes: dict[PlayerId, str] = {}
+        for voter_id, raw_vote in (external_votes or {}).items():
+            if voter_id == target_id or voter_id not in self.state.bots or not self.state.bots[voter_id].is_alive:
+                continue
+            vote = raw_vote.lower()
+            votes[voter_id] = "guilty" if vote == "guilty" else "innocent"
+
+        for voter in self.state.alive_bots():
+            if voter.bot_id == target_id or voter.bot_id in votes:
+                continue
+            votes[voter.bot_id] = self._select_trial_vote(voter, target_id)
+
+        self.last_trial_votes = votes.copy()
+        for voter_id, vote in votes.items():
+            event = EventType.TRIAL_VOTE_GUILTY if vote == "guilty" else EventType.TRIAL_VOTE_INNOCENT
+            self.codex.apply(self.state, event, actor_id=voter_id, target_id=target_id)
+
+        guilty = sum(1 for vote in votes.values() if vote == "guilty")
+        innocent = len(votes) - guilty
+        exiled: PlayerId | None = None
+        if guilty > innocent:
+            exiled = target_id
+            self.codex.apply(self.state, EventType.DAY_EXILE, target_id=target_id)
+        else:
+            self.state.event_log.append(f"Player {target_id} was acquitted")
+
         self.state.day_index += 1
+        self.state.trial_target = None
         return exiled
+
+    def resolve_day_phase(self) -> PlayerId | None:
+        """Backward-compatible one-call day resolver: nomination then trial."""
+
+        self.resolve_nomination_phase()
+        return self.resolve_trial_phase()
+
+    def _select_trial_vote(self, voter: MafiaBot, target_id: PlayerId) -> str:
+        pressure = voter.suspicion_matrix[target_id] - 0.55 * voter.empathy_matrix[target_id]
+        pressure += voter.psychotype.aggression * 0.15
+        pressure -= voter.psychotype.conformity * 0.05
+        return "guilty" if pressure >= 0.28 else "innocent"
 
     def _select_day_vote_target(self, voter: MafiaBot) -> PlayerId | None:
         candidates = self.state.alive_ids(exclude=voter.bot_id)

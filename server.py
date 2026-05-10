@@ -35,22 +35,11 @@ from mafia_engine import (
     Role,
     Team,
     first_impression_init,
+    sampled_bot_profiles,
 )
 
 HUMAN_ID: PlayerId = 1
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
-PLAYER_NAMES: dict[PlayerId, str] = {
-    1: "You",
-    2: "Vera",
-    3: "Niko",
-    4: "Mira",
-    5: "Oleg",
-    6: "Lina",
-    7: "Boris",
-    8: "Sasha",
-}
-
-
 class LazyLlamaEvaluator:
     """Defers Qwen GGUF loading until first chat/generation request."""
 
@@ -76,24 +65,33 @@ class LazyLlamaEvaluator:
 
 class ConnectionManager:
     def __init__(self) -> None:
-        self.active: set[WebSocket] = set()
+        self.active: dict[PlayerId, set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, websocket: WebSocket, player_id: PlayerId) -> None:
         await websocket.accept()
-        self.active.add(websocket)
+        self.active.setdefault(player_id, set()).add(websocket)
 
-    def disconnect(self, websocket: WebSocket) -> None:
-        self.active.discard(websocket)
+    def disconnect(self, websocket: WebSocket, player_id: PlayerId | None = None) -> None:
+        if player_id is not None:
+            sockets = self.active.get(player_id, set())
+            sockets.discard(websocket)
+            if not sockets:
+                self.active.pop(player_id, None)
+            return
+        for sockets in self.active.values():
+            sockets.discard(websocket)
 
-    async def broadcast(self, payload: dict[str, Any]) -> None:
-        stale: list[WebSocket] = []
-        for websocket in list(self.active):
-            try:
-                await websocket.send_json(payload)
-            except RuntimeError:
-                stale.append(websocket)
-        for websocket in stale:
-            self.disconnect(websocket)
+    async def broadcast(self, payload: dict[str, Any], recipients: set[PlayerId] | None = None) -> None:
+        stale: list[tuple[PlayerId, WebSocket]] = []
+        target_ids = recipients if recipients is not None else set(self.active)
+        for player_id in target_ids:
+            for websocket in list(self.active.get(player_id, set())):
+                try:
+                    await websocket.send_json(payload)
+                except RuntimeError:
+                    stale.append((player_id, websocket))
+        for player_id, websocket in stale:
+            self.disconnect(websocket, player_id)
 
 
 class WebMafiaGame:
@@ -111,20 +109,32 @@ class WebMafiaGame:
         self._lock = asyncio.Lock()
 
     def _build_web_state(self) -> GameState:
-        rng = random.Random(88)
-        # Player 1 is Mafia so the night "follow the human" intent is visible in the web prototype.
-        roles = [Role.MAFIA, Role.BOSS, Role.MANIAC, Role.COP, Role.DOC, Role.WITNESS, Role.CITIZEN, Role.CITIZEN]
-        genders: list[Gender] = ["male", "female", "male", "male", "female", "female", "male", "female"]
-        bots: dict[PlayerId, MafiaBot] = {}
-        for bot_id, (role, gender) in enumerate(zip(roles, genders), start=1):
+        rng = random.Random()
+        role_deck = [Role.MAFIA, Role.BOSS, Role.MANIAC, Role.COP, Role.DOC, Role.WITNESS, Role.CITIZEN, Role.CITIZEN]
+        rng.shuffle(role_deck)
+        sampled_profiles = sampled_bot_profiles(rng, count=7)
+        bots: dict[PlayerId, MafiaBot] = {
+            HUMAN_ID: MafiaBot(
+                bot_id=HUMAN_ID,
+                gender="male",
+                role=role_deck[0],
+                display_name="You",
+                avatar_base="human",
+                psychotype=Psychotype(stubbornness=0.55, conformity=0.45, aggression=0.55),
+            )
+        }
+        for bot_id, (role, profile) in enumerate(zip(role_deck[1:], sampled_profiles), start=2):
+            psychotype = profile["psychotype"]
             bots[bot_id] = MafiaBot(
                 bot_id=bot_id,
-                gender=gender,
+                gender=profile["gender"],
                 role=role,
+                display_name=profile["name"],
+                avatar_base=profile["avatar_base"],
                 psychotype=Psychotype(
-                    stubbornness=rng.uniform(0.2, 0.8),
-                    conformity=rng.uniform(0.2, 0.8),
-                    aggression=rng.uniform(0.2, 0.8),
+                    stubbornness=float(psychotype["stubbornness"]),
+                    conformity=float(psychotype["conformity"]),
+                    aggression=float(psychotype["aggression"]),
                 ),
             )
         state = GameState(bots=bots, rng=rng)
@@ -268,9 +278,13 @@ class WebMafiaGame:
         kind = message.get("type")
         if kind == "chat":
             text = str(message.get("text", "")).strip()
+            channel = "mafia" if message.get("channel") == "mafia" else "general"
             if text:
-                await self.manager.broadcast({"type": "chat", "speaker": player_id, "text": text})
-                await self.router.enqueue_chat(player_id, text, visible_to=self.state.alive_ids(exclude=player_id))
+                recipients = self._chat_recipients(player_id, channel)
+                if not recipients and channel == "mafia":
+                    return
+                await self.manager.broadcast({"type": "chat", "speaker": player_id, "text": text, "channel": channel}, recipients=recipients)
+                await self.router.enqueue_chat(player_id, text, channel=channel)
                 task = asyncio.create_task(self._process_chat_and_broadcast())
                 self.chat_tasks.add(task)
                 task.add_done_callback(self.chat_tasks.discard)
@@ -305,7 +319,7 @@ class WebMafiaGame:
                 return
             actor = self.state.bots[actor_id]
             if actor.team is Team.MAFIA:
-                self.router.set_intent_to_kill(target_id, time.monotonic())
+                self.router.set_intent_to_kill(target_id, time.monotonic(), actor_id=actor_id)
                 self.state.event_log.append(f"P{actor_id} signaled intent to kill P{target_id}")
             elif actor.role is Role.COP:
                 self.state.event_log.append(f"P{actor_id} queued an investigation intent on P{target_id}")
@@ -330,6 +344,14 @@ class WebMafiaGame:
             and self.state.bots[actor_id].is_alive
             and self.state.bots[target_id].is_alive
         )
+
+    def _chat_recipients(self, speaker_id: PlayerId, channel: str) -> set[PlayerId] | None:
+        if channel != "mafia":
+            return None
+        speaker = self.state.bots.get(speaker_id)
+        if speaker is None or speaker.team is not Team.MAFIA or not speaker.is_alive:
+            return set()
+        return {bot.bot_id for bot in self.state.alive_bots() if bot.team is Team.MAFIA}
 
     async def _process_chat_and_broadcast(self) -> None:
         await self.router.process_chat_batch()
@@ -368,26 +390,30 @@ class WebMafiaGame:
             "night": self.state.night_index,
             "human_id": HUMAN_ID,
             "human_role": self.state.bots[HUMAN_ID].role.value,
+            "human_is_mafia": self.state.bots[HUMAN_ID].team is Team.MAFIA,
             "winner": self.state.winner.value if self.state.winner else None,
             "trial_target": self.state.trial_target,
             "role_counter": dict(role_counter),
             "nomination_counts": dict(nomination_counts),
             "trial_counts": dict(trial_counts),
             "leading_targets": leading_targets,
+            "night_intent_counts": dict(Counter(self.router.kill_intents.values())),
             "players": [self._player_snapshot(bot) for bot in self.state.bots.values()],
             "logs": self.state.event_log[-40:],
         }
 
     def _player_snapshot(self, bot: MafiaBot) -> dict[str, Any]:
         revealed_role = bot.public_role.value if bot.public_role else None
-        avatar = f"{bot.avatar_state}.jpg"
+        avatar_key = bot.avatar_state if bot.public_role else bot.avatar_base
+        avatar = f"{avatar_key}.jpg"
         return {
             "id": bot.bot_id,
-            "name": PLAYER_NAMES.get(bot.bot_id, f"P{bot.bot_id}"),
+            "name": bot.display_name,
             "gender": bot.gender,
             "alive": bot.is_alive,
             "revealed_role": revealed_role,
             "avatar": avatar,
+            "avatar_base": bot.avatar_base,
             "vote_count": Counter(self.nomination_votes.values()).get(bot.bot_id, 0),
             "is_leading": bot.bot_id in self.snapshot_leaders(),
             "stress": round(bot.stress_level, 2),
@@ -415,11 +441,11 @@ async def index() -> str:
 
 @app.websocket("/ws/{player_id}")
 async def websocket_endpoint(websocket: WebSocket, player_id: int) -> None:
-    await game.manager.connect(websocket)
+    await game.manager.connect(websocket, player_id)
     await websocket.send_json({"type": "state", "state": game.snapshot()})
     try:
         while True:
             message = await websocket.receive_json()
             await game.handle_action(player_id, message)
     except WebSocketDisconnect:
-        game.manager.disconnect(websocket)
+        game.manager.disconnect(websocket, player_id)
