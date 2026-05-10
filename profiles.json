@@ -1,0 +1,17 @@
+{
+  "bot_1": {"name": "Vera", "gender": "female", "avatar_base": "vera", "psychotype": {"stubbornness": 0.60, "conformity": 0.40, "aggression": 0.50}},
+  "bot_2": {"name": "Nikolai", "gender": "male", "avatar_base": "nikolai", "psychotype": {"stubbornness": 0.72, "conformity": 0.28, "aggression": 0.66}},
+  "bot_3": {"name": "Mira", "gender": "female", "avatar_base": "mira", "psychotype": {"stubbornness": 0.35, "conformity": 0.78, "aggression": 0.30}},
+  "bot_4": {"name": "Oleg", "gender": "male", "avatar_base": "oleg", "psychotype": {"stubbornness": 0.51, "conformity": 0.46, "aggression": 0.62}},
+  "bot_5": {"name": "Lina", "gender": "female", "avatar_base": "lina", "psychotype": {"stubbornness": 0.44, "conformity": 0.63, "aggression": 0.41}},
+  "bot_6": {"name": "Boris", "gender": "male", "avatar_base": "boris", "psychotype": {"stubbornness": 0.83, "conformity": 0.20, "aggression": 0.74}},
+  "bot_7": {"name": "Sasha", "gender": "female", "avatar_base": "sasha", "psychotype": {"stubbornness": 0.39, "conformity": 0.70, "aggression": 0.49}},
+  "bot_8": {"name": "Dmitri", "gender": "male", "avatar_base": "dmitri", "psychotype": {"stubbornness": 0.68, "conformity": 0.52, "aggression": 0.58}},
+  "bot_9": {"name": "Alice", "gender": "female", "avatar_base": "alice", "psychotype": {"stubbornness": 0.55, "conformity": 0.59, "aggression": 0.34}},
+  "bot_10": {"name": "Max", "gender": "male", "avatar_base": "max", "psychotype": {"stubbornness": 0.47, "conformity": 0.44, "aggression": 0.69}},
+  "bot_11": {"name": "Anya", "gender": "female", "avatar_base": "anya", "psychotype": {"stubbornness": 0.62, "conformity": 0.37, "aggression": 0.53}},
+  "bot_12": {"name": "Victor", "gender": "male", "avatar_base": "victor", "psychotype": {"stubbornness": 0.76, "conformity": 0.31, "aggression": 0.61}},
+  "bot_13": {"name": "Katya", "gender": "female", "avatar_base": "katya", "psychotype": {"stubbornness": 0.42, "conformity": 0.73, "aggression": 0.45}},
+  "bot_14": {"name": "John", "gender": "male", "avatar_base": "john", "psychotype": {"stubbornness": 0.58, "conformity": 0.48, "aggression": 0.56}},
+  "bot_15": {"name": "Elena", "gender": "female", "avatar_base": "elena", "psychotype": {"stubbornness": 0.49, "conformity": 0.67, "aggression": 0.38}}
+}
