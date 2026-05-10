@@ -90,6 +90,15 @@ class MafiaEngineTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+
+    def test_human_doc_and_cop_intents_override_bot_math(self) -> None:
+        state = build_demo_state(seed=28)
+        router = NeurosymbolicRouter(state, evaluator=FakeEvaluator())
+        router.set_intent_to_heal(3, timestamp=1.0)
+        router.set_intent_to_investigate(2, timestamp=1.0)
+        self.assertEqual(router._select_doc_target(), 3)
+        self.assertEqual(router._select_cop_check_target(), 2)
+
     def test_llama_evaluator_uses_json_schema_and_clamps_output(self) -> None:
         async def scenario() -> None:
             fake_llm = FakeLlama()
@@ -112,7 +121,7 @@ class MafiaEngineTests(unittest.TestCase):
             router = NeurosymbolicRouter(state, evaluator=FailingEvaluator())
             await router.enqueue_chat(4, "this will fail", visible_to=[5])
             await router.process_chat_batch()
-            self.assertTrue(any("LLM chat evaluation failed" in event for event in state.event_log))
+            self.assertTrue(any("LLM evaluation failed for P4" in event for event in state.event_log))
 
         asyncio.run(scenario())
 

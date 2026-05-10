@@ -550,6 +550,8 @@ class NeurosymbolicRouter:
         self.last_day_votes: dict[PlayerId, PlayerId] = {}
         self.last_trial_votes: dict[PlayerId, str] = {}
         self.intent_to_kill: tuple[PlayerId, float] | None = None
+        self.intent_to_heal: tuple[PlayerId, float] | None = None
+        self.intent_to_investigate: tuple[PlayerId, float] | None = None
         self.kill_intents: dict[PlayerId, PlayerId] = {}
 
     def queue_night_actions(self) -> NightResolution:
@@ -576,8 +578,22 @@ class NeurosymbolicRouter:
             if actor_id == 1:
                 self.intent_to_kill = (target_id, timestamp)
 
+    def set_intent_to_heal(self, target_id: PlayerId, timestamp: float) -> None:
+        """Store the human Doctor heal intent for deterministic night resolution."""
+
+        if target_id in self.state.bots and self.state.bots[target_id].is_alive:
+            self.intent_to_heal = (target_id, timestamp)
+
+    def set_intent_to_investigate(self, target_id: PlayerId, timestamp: float) -> None:
+        """Store the human Cop investigation intent for deterministic night resolution."""
+
+        if target_id in self.state.bots and self.state.bots[target_id].is_alive:
+            self.intent_to_investigate = (target_id, timestamp)
+
     def clear_intent_to_kill(self) -> None:
         self.intent_to_kill = None
+        self.intent_to_heal = None
+        self.intent_to_investigate = None
         self.kill_intents.clear()
 
     def _mafia_chat_audience(self, speaker_id: PlayerId) -> tuple[PlayerId, ...]:
@@ -608,13 +624,11 @@ class NeurosymbolicRouter:
         if not batch:
             return
 
-        tasks = [self._evaluate_one_message(message) for message in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for message, result in zip(batch, results):
-            if isinstance(result, Exception):
-                self.state.event_log.append(
-                    f"LLM chat evaluation failed for speaker {message.speaker_id} in {message.channel} chat: {result}"
-                )
+        for message in batch:
+            try:
+                await self._evaluate_one_message(message)
+            except Exception as e:
+                self.state.event_log.append(f"LLM evaluation failed for P{message.speaker_id}: {e}")
 
     async def _evaluate_one_message(self, message: ChatMessage) -> None:
         context = {"speaker_id": message.speaker_id, "alive_target_ids": list(message.visible_to), "channel": message.channel}
@@ -835,9 +849,7 @@ class NeurosymbolicRouter:
                 scores[target.bot_id] -= 0.2 * mafioso.empathy_matrix[target.bot_id]
 
         if self.intent_to_kill is not None:
-            intended_target_id, _timestamp = self.intent_to_kill
-            if intended_target_id in scores:
-                scores[intended_target_id] += 5.0
+            return self.intent_to_kill[0]
 
         return max(scores, key=scores.get)
 
@@ -870,6 +882,8 @@ class NeurosymbolicRouter:
         docs = self.state.by_role(Role.DOC)
         if not docs or docs[0].is_frozen:
             return None
+        if self.intent_to_heal is not None and self.intent_to_heal[0] in self.state.alive_ids():
+            return self.intent_to_heal[0]
         doc = docs[0]
         candidates = self.state.alive_ids()
         return max(candidates, key=lambda target_id: doc.empathy_matrix[target_id] + doc.suspicion_matrix[target_id])
@@ -878,6 +892,8 @@ class NeurosymbolicRouter:
         cops = self.state.by_role(Role.COP)
         if not cops or cops[0].is_frozen:
             return None
+        if self.intent_to_investigate is not None and self.intent_to_investigate[0] in self.state.alive_ids():
+            return self.intent_to_investigate[0]
         cop = cops[0]
         candidates = self.state.alive_ids(exclude=cop.bot_id)
         return max(candidates, key=lambda target_id: cop.suspicion_matrix[target_id], default=None)

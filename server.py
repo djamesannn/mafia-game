@@ -14,7 +14,7 @@ import random
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -87,6 +87,7 @@ class LazyLlamaEvaluator:
 class ConnectionManager:
     def __init__(self) -> None:
         self.active: dict[PlayerId, set[WebSocket]] = {}
+        self.on_empty: Callable[[], None] | None = None
 
     async def connect(self, websocket: WebSocket, player_id: PlayerId) -> None:
         await websocket.accept()
@@ -98,9 +99,16 @@ class ConnectionManager:
             sockets.discard(websocket)
             if not sockets:
                 self.active.pop(player_id, None)
-            return
-        for sockets in self.active.values():
-            sockets.discard(websocket)
+        else:
+            for sockets in self.active.values():
+                sockets.discard(websocket)
+            self.active = {pid: sockets for pid, sockets in self.active.items() if sockets}
+
+        if self.is_empty() and self.on_empty is not None:
+            self.on_empty()
+
+    def is_empty(self) -> bool:
+        return not any(self.active.values())
 
     async def broadcast(self, payload: dict[str, Any], recipients: set[PlayerId] | None = None) -> None:
         stale: list[tuple[PlayerId, WebSocket]] = []
@@ -411,6 +419,8 @@ class WebMafiaGame:
     async def handle_action(self, player_id: PlayerId, message: dict[str, Any]) -> None:
         kind = message.get("type")
         if kind == "chat":
+            if player_id not in self.state.bots or not self.state.bots[player_id].is_alive:
+                return
             text = str(message.get("text", "")).strip()
             channel = "mafia" if message.get("channel") == "mafia" else "general"
             if text:
@@ -456,8 +466,10 @@ class WebMafiaGame:
                 self.router.set_intent_to_kill(target_id, time.monotonic(), actor_id=actor_id)
                 self.state.event_log.append(f"P{actor_id} signaled intent to kill P{target_id}")
             elif actor.role is Role.COP:
+                self.router.set_intent_to_investigate(target_id, time.monotonic())
                 self.state.event_log.append(f"P{actor_id} queued an investigation intent on P{target_id}")
             elif actor.role is Role.DOC:
+                self.router.set_intent_to_heal(target_id, time.monotonic())
                 self.state.event_log.append(f"P{actor_id} queued a heal intent on P{target_id}")
 
     def _record_nomination(self, voter_id: PlayerId, target_id: PlayerId) -> None:
@@ -572,9 +584,21 @@ class RoomManager:
             game = self.games.get(room_id)
             if game is None:
                 game = WebMafiaGame(room_size=room_size, human_role=human_role)
+                game.manager.on_empty = lambda room_id=room_id: asyncio.create_task(self.remove_game(room_id))
                 self.games[room_id] = game
             game.start()
             return game
+
+    async def remove_game(self, room_id: str) -> None:
+        async with self._lock:
+            game = self.games.pop(room_id, None)
+            if game is None:
+                return
+            if game.phase_task is not None and not game.phase_task.done():
+                game.phase_task.cancel()
+            for task in list(game.chat_tasks | game.bot_action_tasks):
+                if not task.done():
+                    task.cancel()
 
 
 room_manager = RoomManager()
