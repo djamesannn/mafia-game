@@ -16,7 +16,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
@@ -37,11 +37,28 @@ from mafia_engine import (
     Role,
     Team,
     first_impression_init,
+    role_pool_for_size,
     sampled_bot_profiles,
 )
 
 HUMAN_ID: PlayerId = 1
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
+ROLE_NAME_MAP: dict[str, Role] = {
+    "citizen": Role.CITIZEN,
+    "boss": Role.BOSS,
+    "mafia": Role.MAFIA,
+    "cop": Role.COP,
+    "doctor": Role.DOC,
+    "doc": Role.DOC,
+    "witness": Role.WITNESS,
+    "maniac": Role.MANIAC,
+}
+
+
+def parse_human_role(role_name: str | None) -> Role | None:
+    if role_name is None or role_name.lower() == "random":
+        return None
+    return ROLE_NAME_MAP.get(role_name.lower())
 
 
 class LazyLlamaEvaluator:
@@ -104,8 +121,10 @@ class ConnectionManager:
 class WebMafiaGame:
     """Real-time phase controller for the browser UI."""
 
-    def __init__(self) -> None:
-        self.state = self._build_web_state()
+    def __init__(self, room_size: int = 8, human_role: Role | None = None) -> None:
+        self.room_size = room_size
+        self.human_role = human_role
+        self.state = self._build_web_state(room_size, human_role)
         self.router = NeurosymbolicRouter(self.state, evaluator=LazyLlamaEvaluator())
         self.manager = ConnectionManager()
         self.phase_deadline = time.monotonic()
@@ -116,22 +135,31 @@ class WebMafiaGame:
         self.phase_task: asyncio.Task[Any] | None = None
         self._lock = asyncio.Lock()
 
-    def _build_web_state(self) -> GameState:
+    def _build_web_state(self, room_size: int, human_role: Role | None) -> GameState:
         rng = random.Random()
-        role_deck = [Role.MAFIA, Role.BOSS, Role.MANIAC, Role.COP, Role.DOC, Role.WITNESS, Role.CITIZEN, Role.CITIZEN]
+        role_deck = role_pool_for_size(room_size)
+        if human_role is not None:
+            if human_role not in role_deck:
+                raise ValueError(f"Role {human_role.value} is not available for a {room_size}-player room")
+            role_deck.remove(human_role)
+            selected_human_role = human_role
+        else:
+            selected_human_role = rng.choice(role_deck)
+            role_deck.remove(selected_human_role)
         rng.shuffle(role_deck)
-        sampled_profiles = sampled_bot_profiles(rng, count=7)
+
+        sampled_profiles = sampled_bot_profiles(rng, count=room_size - 1)
         bots: dict[PlayerId, MafiaBot] = {
             HUMAN_ID: MafiaBot(
                 bot_id=HUMAN_ID,
                 gender="male",
-                role=role_deck[0],
+                role=selected_human_role,
                 display_name="You",
                 avatar_base="human",
                 psychotype=Psychotype(stubbornness=0.55, conformity=0.45, aggression=0.55),
             )
         }
-        for bot_id, (role, profile) in enumerate(zip(role_deck[1:], sampled_profiles), start=2):
+        for bot_id, (role, profile) in enumerate(zip(role_deck, sampled_profiles), start=2):
             psychotype = profile["psychotype"]
             bots[bot_id] = MafiaBot(
                 bot_id=bot_id,
@@ -539,11 +567,11 @@ class RoomManager:
         self.games: dict[str, WebMafiaGame] = {}
         self._lock = asyncio.Lock()
 
-    async def get_game(self, room_id: str) -> WebMafiaGame:
+    async def get_game(self, room_id: str, room_size: int = 8, human_role: Role | None = None) -> WebMafiaGame:
         async with self._lock:
             game = self.games.get(room_id)
             if game is None:
-                game = WebMafiaGame()
+                game = WebMafiaGame(room_size=room_size, human_role=human_role)
                 self.games[room_id] = game
             game.start()
             return game
@@ -559,8 +587,14 @@ async def index() -> str:
 
 
 @app.websocket("/ws/{room_id}/{player_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int) -> None:
-    game = await room_manager.get_game(room_id)
+async def websocket_endpoint(
+    websocket: WebSocket,
+    room_id: str,
+    player_id: int,
+    size: int = Query(8),
+    human_role: str = Query("Random"),
+) -> None:
+    game = await room_manager.get_game(room_id, room_size=size, human_role=parse_human_role(human_role))
     await game.manager.connect(websocket, player_id)
     try:
         await websocket.send_json({"type": "state", "state": game.snapshot()})

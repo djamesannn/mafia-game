@@ -234,6 +234,29 @@ def sampled_bot_profiles(rng: random.Random, count: int = 7, profile_path: str |
     return rng.sample(profiles, count)
 
 
+def role_pool_for_size(room_size: int) -> list[Role]:
+    """Return the supported role pool for a configured room size."""
+
+    if room_size == 8:
+        return [Role.BOSS, Role.MAFIA, Role.COP, Role.DOC, Role.WITNESS, Role.CITIZEN, Role.CITIZEN, Role.CITIZEN]
+    if room_size == 12:
+        return [
+            Role.BOSS,
+            Role.MAFIA,
+            Role.MAFIA,
+            Role.MANIAC,
+            Role.COP,
+            Role.DOC,
+            Role.WITNESS,
+            Role.CITIZEN,
+            Role.CITIZEN,
+            Role.CITIZEN,
+            Role.CITIZEN,
+            Role.CITIZEN,
+        ]
+    raise ValueError("Only room sizes 8 and 12 are supported")
+
+
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
@@ -351,7 +374,39 @@ class EventCodex:
     def _public_role_reveal(self, state: GameState, target_id: PlayerId | None) -> None:
         if target_id is None:
             return
-        state.bots[target_id].reveal_role()
+        revealed_bot = state.bots[target_id]
+        revealed_bot.reveal_role()
+        self._retrospective_role_reveal_update(state, target_id, revealed_bot.role)
+
+    def _retrospective_role_reveal_update(self, state: GameState, dead_id: PlayerId, revealed_role: Role) -> None:
+        """Re-score living peers after a death reveal exposes prior bad reads.
+
+        This is deterministic post-mortem graph analysis: defending a revealed
+        Mafia/Boss or pushing a revealed town role makes living observers more
+        suspicious of the player who held that now-discredited matrix stance.
+        """
+
+        alive_bots = state.alive_bots()
+        mafia_revealed = revealed_role in {Role.MAFIA, Role.BOSS}
+        town_revealed = revealed_role in {Role.CITIZEN, Role.COP, Role.DOC, Role.WITNESS}
+        if not mafia_revealed and not town_revealed:
+            return
+
+        for voter in alive_bots:
+            if voter.bot_id == dead_id:
+                continue
+            defended_killer = mafia_revealed and voter.empathy_matrix.get(dead_id, 0.0) > 0.2
+            pushed_innocent = town_revealed and voter.suspicion_matrix.get(dead_id, 0.0) > 0.4
+            if not defended_killer and not pushed_innocent:
+                continue
+
+            delta = 0.15 if defended_killer else 0.12
+            for observer in alive_bots:
+                if observer.bot_id in {dead_id, voter.bot_id}:
+                    continue
+                add_clamped(observer.suspicion_matrix, voter.bot_id, delta, 0.0, 1.0)
+
+        state.event_log.append(f"Retrospective matrix update applied for revealed {revealed_role.value} P{dead_id}")
 
 
 class LlamaJSONEvaluator:

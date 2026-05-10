@@ -8,6 +8,7 @@ from mafia_engine import (
     LlamaJSONEvaluator,
     NeurosymbolicRouter,
     load_bot_profiles,
+    role_pool_for_size,
     Phase,
     Role,
     Team,
@@ -144,6 +145,28 @@ class MafiaEngineTests(unittest.TestCase):
             self.assertEqual(state.bots[4].suspicion_matrix[1], town_before)
 
         asyncio.run(scenario())
+
+
+    def test_role_pool_supports_8_and_12_player_rooms(self) -> None:
+        self.assertEqual(len(role_pool_for_size(8)), 8)
+        self.assertEqual(len(role_pool_for_size(12)), 12)
+        self.assertEqual(sum(1 for role in role_pool_for_size(12) if role is Role.MAFIA), 2)
+        with self.assertRaises(ValueError):
+            role_pool_for_size(10)
+
+    def test_post_mortem_reveal_punishes_defending_mafia(self) -> None:
+        state = build_demo_state(seed=26)
+        state.bots[2].empathy_matrix[1] = 0.7
+        before = state.bots[3].suspicion_matrix[2]
+        EventCodex().apply(state, EventType.DAY_EXILE, target_id=1)
+        self.assertGreaterEqual(state.bots[3].suspicion_matrix[2], min(1.0, before + 0.15))
+
+    def test_post_mortem_reveal_punishes_pushing_town(self) -> None:
+        state = build_demo_state(seed=27)
+        state.bots[2].suspicion_matrix[4] = 0.8
+        before = state.bots[3].suspicion_matrix[2]
+        EventCodex().apply(state, EventType.DAY_EXILE, target_id=4)
+        self.assertGreaterEqual(state.bots[3].suspicion_matrix[2], min(1.0, before + 0.12))
 
     def test_trial_phase_exiles_only_when_guilty_majority(self) -> None:
         state = build_demo_state(seed=21)
