@@ -1,0 +1,3 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+llama-cpp-python>=0.2.90
