@@ -613,62 +613,10 @@ class NeurosymbolicRouter:
         counts = Counter(votes.values())
         top_count = max(counts.values())
         tied = [target_id for target_id, count in counts.items() if count == top_count]
-        self.state.trial_target = self.state.rng.choice(tied)
-        self.state.event_log.append(f"Player {self.state.trial_target} is on trial")
-        return self.state.trial_target
-
-    def resolve_trial_phase(self, external_votes: Mapping[PlayerId, str] | None = None) -> PlayerId | None:
-        """Resolve guilty/innocent votes for the current trial target."""
-
-        target_id = self.state.trial_target
-        if target_id is None or target_id not in self.state.bots or not self.state.bots[target_id].is_alive:
-            self.last_trial_votes = {}
-            self.state.day_index += 1
-            self.state.trial_target = None
-            self.state.event_log.append("Trial skipped because there was no valid target")
-            return None
-
-        votes: dict[PlayerId, str] = {}
-        for voter_id, raw_vote in (external_votes or {}).items():
-            if voter_id == target_id or voter_id not in self.state.bots or not self.state.bots[voter_id].is_alive:
-                continue
-            vote = raw_vote.lower()
-            votes[voter_id] = "guilty" if vote == "guilty" else "innocent"
-
-        for voter in self.state.alive_bots():
-            if voter.bot_id == target_id or voter.bot_id in votes:
-                continue
-            votes[voter.bot_id] = self._select_trial_vote(voter, target_id)
-
-        self.last_trial_votes = votes.copy()
-        for voter_id, vote in votes.items():
-            event = EventType.TRIAL_VOTE_GUILTY if vote == "guilty" else EventType.TRIAL_VOTE_INNOCENT
-            self.codex.apply(self.state, event, actor_id=voter_id, target_id=target_id)
-
-        guilty = sum(1 for vote in votes.values() if vote == "guilty")
-        innocent = len(votes) - guilty
-        exiled: PlayerId | None = None
-        if guilty > innocent:
-            exiled = target_id
-            self.codex.apply(self.state, EventType.DAY_EXILE, target_id=target_id)
-        else:
-            self.state.event_log.append(f"Player {target_id} was acquitted")
-
+        exiled = self.state.rng.choice(tied)
+        self.codex.apply(self.state, EventType.DAY_EXILE, target_id=exiled)
         self.state.day_index += 1
-        self.state.trial_target = None
         return exiled
-
-    def resolve_day_phase(self) -> PlayerId | None:
-        """Backward-compatible one-call day resolver: nomination then trial."""
-
-        self.resolve_nomination_phase()
-        return self.resolve_trial_phase()
-
-    def _select_trial_vote(self, voter: MafiaBot, target_id: PlayerId) -> str:
-        pressure = voter.suspicion_matrix[target_id] - 0.55 * voter.empathy_matrix[target_id]
-        pressure += voter.psychotype.aggression * 0.15
-        pressure -= voter.psychotype.conformity * 0.05
-        return "guilty" if pressure >= 0.28 else "innocent"
 
     def _select_day_vote_target(self, voter: MafiaBot) -> PlayerId | None:
         candidates = self.state.alive_ids(exclude=voter.bot_id)
