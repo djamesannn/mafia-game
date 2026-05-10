@@ -32,7 +32,9 @@ Gender = Literal["male", "female"]
 MIN_PLAYERS = 8
 MAX_PLAYERS = 12
 NIGHT_DURATION_SECONDS = 30.0
-DAY_DURATION_SECONDS = 45.0
+DAY_NOMINATION_DURATION_SECONDS = 45.0
+DAY_TRIAL_DURATION_SECONDS = 30.0
+DAY_DURATION_SECONDS = DAY_NOMINATION_DURATION_SECONDS
 
 
 class Role(str, Enum):
@@ -51,7 +53,9 @@ class Phase(str, Enum):
     """Finite states for the authoritative game loop."""
 
     NIGHT = "night"
-    DAY = "day"
+    DAY_NOMINATION = "day_nomination"
+    DAY_TRIAL = "day_trial"
+    DAY = "day_nomination"  # Backward-compatible alias for older integrations.
     FINISHED = "finished"
 
 
@@ -73,6 +77,8 @@ class EventType(str, Enum):
     NIGHT_KILL = "NIGHT_KILL"
     DOC_HEAL = "DOC_HEAL"
     DAY_EXILE = "DAY_EXILE"
+    TRIAL_VOTE_GUILTY = "TRIAL_VOTE_GUILTY"
+    TRIAL_VOTE_INNOCENT = "TRIAL_VOTE_INNOCENT"
     PUBLIC_ROLE_REVEAL = "PUBLIC_ROLE_REVEAL"
 
 
@@ -177,6 +183,7 @@ class GameState:
     rng: random.Random = field(default_factory=random.Random)
     event_log: list[str] = field(default_factory=list)
     winner: Team | None = None
+    trial_target: PlayerId | None = None
 
     def __post_init__(self) -> None:
         if not MIN_PLAYERS <= len(self.bots) <= MAX_PLAYERS:
@@ -235,6 +242,10 @@ class EventCodex:
             self._witness_reveal(state, target_id)
         elif event_type is EventType.PUBLIC_ROLE_REVEAL:
             self._public_role_reveal(state, target_id)
+        elif event_type is EventType.TRIAL_VOTE_GUILTY:
+            self._trial_vote_guilty(state, actor_id, target_id)
+        elif event_type is EventType.TRIAL_VOTE_INNOCENT:
+            self._trial_vote_innocent(state, actor_id, target_id)
         elif event_type is EventType.BOSS_FREEZE and target_id is not None:
             state.bots[target_id].is_frozen = True
             state.event_log.append(f"Boss froze player {target_id}")
@@ -281,6 +292,34 @@ class EventCodex:
                 observer.suspicion_matrix[killer_id] = 1.0
                 add_clamped(observer.empathy_matrix, killer_id, -0.75, -1.0, 1.0)
         state.event_log.append(f"Witness publicly revealed killer {killer_id}")
+
+    def _trial_vote_guilty(self, state: GameState, actor_id: PlayerId | None, target_id: PlayerId | None) -> None:
+        if actor_id is None or target_id is None or actor_id == target_id:
+            return
+        voter = state.bots[actor_id]
+        for observer in state.alive_bots():
+            if observer.bot_id in {actor_id, target_id}:
+                continue
+            if observer.empathy_matrix.get(target_id, 0.0) > 0.15:
+                add_clamped(observer.empathy_matrix, actor_id, -0.18, -1.0, 1.0)
+            else:
+                add_clamped(observer.suspicion_matrix, target_id, 0.02, 0.0, 1.0)
+        add_clamped(voter.suspicion_matrix, target_id, 0.08, 0.0, 1.0)
+        state.event_log.append(f"Player {actor_id} voted Guilty on {target_id}")
+
+    def _trial_vote_innocent(self, state: GameState, actor_id: PlayerId | None, target_id: PlayerId | None) -> None:
+        if actor_id is None or target_id is None or actor_id == target_id:
+            return
+        voter = state.bots[actor_id]
+        for observer in state.alive_bots():
+            if observer.bot_id in {actor_id, target_id}:
+                continue
+            if observer.suspicion_matrix.get(target_id, 0.0) > 0.35:
+                add_clamped(observer.suspicion_matrix, actor_id, 0.18, 0.0, 1.0)
+            else:
+                add_clamped(observer.empathy_matrix, actor_id, 0.04, -1.0, 1.0)
+        add_clamped(voter.empathy_matrix, target_id, 0.08, -1.0, 1.0)
+        state.event_log.append(f"Player {actor_id} voted Innocent on {target_id}")
 
     def _public_role_reveal(self, state: GameState, target_id: PlayerId | None) -> None:
         if target_id is None:
@@ -410,6 +449,8 @@ class NeurosymbolicRouter:
         self._chat_queue: asyncio.Queue[ChatMessage] = asyncio.Queue()
         self.last_night_resolution: NightResolution | None = None
         self.last_day_votes: dict[PlayerId, PlayerId] = {}
+        self.last_trial_votes: dict[PlayerId, str] = {}
+        self.intent_to_kill: tuple[PlayerId, float] | None = None
 
     def queue_night_actions(self) -> NightResolution:
         """Resolve the deterministic night queue and store it for morning UI/CLI.
@@ -426,6 +467,15 @@ class NeurosymbolicRouter:
         """Return the latest resolved night summary for presentation layers."""
 
         return self.last_night_resolution
+
+    def set_intent_to_kill(self, target_id: PlayerId, timestamp: float) -> None:
+        """Store the human Mafia kill intent for bot-Mafia coordination."""
+
+        if target_id in self.state.bots and self.state.bots[target_id].is_alive:
+            self.intent_to_kill = (target_id, timestamp)
+
+    def clear_intent_to_kill(self) -> None:
+        self.intent_to_kill = None
 
     async def enqueue_chat(self, speaker_id: PlayerId, text: str, visible_to: Iterable[PlayerId] | None = None) -> None:
         audience = tuple(visible_to or self.state.alive_ids(exclude=speaker_id))
@@ -485,14 +535,21 @@ class NeurosymbolicRouter:
             if self.state.phase is Phase.NIGHT:
                 await self.process_chat_batch()
                 self.resolve_night_phase()
-                self._advance_or_finish(Phase.DAY)
+                self._advance_or_finish(Phase.DAY_NOMINATION)
                 continue
 
             deadline = asyncio.get_running_loop().time() + day_seconds
-            while asyncio.get_running_loop().time() < deadline and self.state.phase is Phase.DAY:
+            while asyncio.get_running_loop().time() < deadline and self.state.phase is Phase.DAY_NOMINATION:
                 await self.process_chat_batch()
                 await asyncio.sleep(0.05)
-            self.resolve_day_phase()
+            self.resolve_nomination_phase()
+            self._advance_or_finish(Phase.DAY_TRIAL)
+
+            trial_deadline = asyncio.get_running_loop().time() + DAY_TRIAL_DURATION_SECONDS
+            while asyncio.get_running_loop().time() < trial_deadline and self.state.phase is Phase.DAY_TRIAL:
+                await self.process_chat_batch()
+                await asyncio.sleep(0.05)
+            self.resolve_trial_phase()
             self._advance_or_finish(Phase.NIGHT)
         return self.state.winner
 
@@ -533,22 +590,24 @@ class NeurosymbolicRouter:
         self.state.night_index += 1
         return resolution
 
-    def resolve_day_phase(self) -> PlayerId | None:
-        """Run deterministic vote based on suspicion matrices and freeze state."""
+    def resolve_nomination_phase(self, external_votes: Mapping[PlayerId, PlayerId] | None = None) -> PlayerId | None:
+        """Resolve preliminary day votes and choose the trial target."""
 
-        votes: dict[PlayerId, PlayerId] = {}
+        votes: dict[PlayerId, PlayerId] = dict(external_votes or {})
         for voter in self.state.alive_bots():
-            if voter.is_frozen:
+            if voter.is_frozen or voter.bot_id in votes:
                 continue
             target = self._select_day_vote_target(voter)
             if target is not None:
                 votes[voter.bot_id] = target
-                self.codex.apply(self.state, EventType.VOTE_AGAINST, actor_id=voter.bot_id, target_id=target)
 
         self.last_day_votes = votes.copy()
+        for voter_id, target_id in votes.items():
+            self.codex.apply(self.state, EventType.VOTE_AGAINST, actor_id=voter_id, target_id=target_id)
+
         if not votes:
-            self.state.event_log.append("Day ended with no valid votes")
-            self.state.day_index += 1
+            self.state.trial_target = None
+            self.state.event_log.append("Nomination ended with no valid votes")
             return None
 
         counts = Counter(votes.values())
@@ -599,6 +658,12 @@ class NeurosymbolicRouter:
                 scores[target.bot_id] += role_threat.get(target.role, 0.2)
                 scores[target.bot_id] += 0.4 * mafioso.suspicion_matrix[target.bot_id]
                 scores[target.bot_id] -= 0.2 * mafioso.empathy_matrix[target.bot_id]
+
+        if self.intent_to_kill is not None:
+            intended_target_id, _timestamp = self.intent_to_kill
+            if intended_target_id in scores:
+                scores[intended_target_id] += 5.0
+
         return max(scores, key=scores.get)
 
     def _select_maniac_target(self) -> PlayerId | None:
@@ -705,17 +770,33 @@ def build_demo_state(seed: int = 7) -> GameState:
     return state
 
 
+class DemoEvaluator:
+    """Tiny local evaluator used only by `python mafia_engine.py` smoke runs."""
+
+    async def evaluate_chat_message(self, speaker_id: PlayerId, text: str, listeners_context: Mapping[str, Any]) -> LLMChatDelta:
+        target_ids = list(listeners_context.get("alive_target_ids", []))[:1]
+        return LLMChatDelta(
+            reasoning_chain="demo evaluator",
+            d_suspicion={target_id: 0.04 for target_id in target_ids},
+            d_empathy={target_id: -0.02 for target_id in target_ids},
+            stress_impact=0.01,
+        )
+
+    async def generate_bot_chat(self, bot: MafiaBot, public_context: Mapping[str, Any]) -> str:
+        return f"P{bot.bot_id} is watching the table carefully."
+
+
 async def demo_round() -> GameState:
     """Run one illustrative night/day cycle without any frontend dependency."""
 
     state = build_demo_state()
-    router = NeurosymbolicRouter(state)
+    router = NeurosymbolicRouter(state, evaluator=DemoEvaluator())
     await router.enqueue_chat(4, "P1 is suspicious, maybe mafia", visible_to=state.alive_ids(exclude=4))
     await router.enqueue_chat(5, "I trust P4, P3 feels unsafe", visible_to=state.alive_ids(exclude=5))
     await router.process_chat_batch()
     router.resolve_night_phase()
-    router._advance_or_finish(Phase.DAY)
-    if state.phase is Phase.DAY:
+    router._advance_or_finish(Phase.DAY_NOMINATION)
+    if state.phase is Phase.DAY_NOMINATION:
         router.resolve_day_phase()
         router._advance_or_finish(Phase.NIGHT)
     return state

@@ -93,12 +93,42 @@ class MafiaEngineTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+
+    def test_trial_phase_exiles_only_when_guilty_majority(self) -> None:
+        state = build_demo_state(seed=21)
+        router = NeurosymbolicRouter(state, evaluator=FakeEvaluator())
+        target = router.resolve_nomination_phase({1: 2, 3: 2, 4: 2})
+        self.assertEqual(target, 2)
+        exiled = router.resolve_trial_phase({1: "guilty", 3: "guilty", 4: "innocent", 5: "innocent", 6: "innocent", 7: "guilty", 8: "guilty"})
+        self.assertEqual(exiled, 2)
+        self.assertFalse(state.bots[2].is_alive)
+
+    def test_trial_vote_events_shift_observer_matrices(self) -> None:
+        state = build_demo_state(seed=22)
+        observer = state.bots[3]
+        observer.empathy_matrix[4] = 0.5
+        before_empathy = observer.empathy_matrix[2]
+        EventCodex().apply(state, EventType.TRIAL_VOTE_GUILTY, actor_id=2, target_id=4)
+        self.assertLess(observer.empathy_matrix[2], before_empathy)
+
+        observer.suspicion_matrix[5] = 0.7
+        before_suspicion = observer.suspicion_matrix[6]
+        EventCodex().apply(state, EventType.TRIAL_VOTE_INNOCENT, actor_id=6, target_id=5)
+        self.assertGreater(observer.suspicion_matrix[6], before_suspicion)
+
+    def test_human_mafia_intent_heavily_weights_consensus_target(self) -> None:
+        state = build_demo_state(seed=23)
+        state.bots[1].role = Role.MAFIA
+        router = NeurosymbolicRouter(state, evaluator=FakeEvaluator())
+        router.set_intent_to_kill(8, timestamp=10.0)
+        self.assertEqual(router._select_mafia_consensus_target(), 8)
+
     def test_demo_round_remains_authoritative_fast_path(self) -> None:
         state = build_demo_state(seed=15)
         router = NeurosymbolicRouter(state, evaluator=FakeEvaluator())
         router.resolve_night_phase()
-        router._advance_or_finish(Phase.DAY)
-        self.assertIn(state.phase, {Phase.DAY, Phase.FINISHED})
+        router._advance_or_finish(Phase.DAY_NOMINATION)
+        self.assertIn(state.phase, {Phase.DAY_NOMINATION, Phase.FINISHED})
         if state.winner is not None:
             self.assertIn(state.winner, {Team.TOWN, Team.MAFIA, Team.MANIAC})
 

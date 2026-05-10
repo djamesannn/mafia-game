@@ -156,7 +156,7 @@ async def run_cli_game() -> None:
             print(f"\n=== Night {state.night_index} ===")
             print("Night is passing...")
             router.queue_night_actions()
-            router._advance_or_finish(Phase.DAY)
+            router._advance_or_finish(Phase.DAY_NOMINATION)
             continue
 
         print_morning_report(state, router)

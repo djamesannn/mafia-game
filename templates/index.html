@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Neurosymbolic Mafia</title>
+  <style>
+    :root {
+      --bg: #0c1020;
+      --panel: #151b31;
+      --panel-2: #1f2742;
+      --accent: #f6c453;
+      --danger: #ff334f;
+      --safe: #47d18c;
+      --text: #f5f7ff;
+      --muted: #9aa7c7;
+      --line: rgba(255,255,255,.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at top, #26365f 0, #0c1020 48%, #060914 100%);
+    }
+    .topbar {
+      display: grid;
+      grid-template-columns: 1fr auto 1.5fr;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(5, 8, 20, .82);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+    }
+    .phase { font-size: 20px; font-weight: 800; color: var(--accent); }
+    .timer {
+      width: 86px;
+      height: 44px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(246,196,83,.5);
+      border-radius: 12px;
+      background: rgba(246,196,83,.12);
+      font-size: 24px;
+      font-weight: 900;
+    }
+    .role-counter { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+    .role-pill { padding: 6px 9px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+    main { display: grid; grid-template-columns: minmax(560px, 1fr) 380px; gap: 18px; padding: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 14px; }
+    .card {
+      position: relative;
+      min-height: 230px;
+      padding: 12px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(31,39,66,.96), rgba(16,22,41,.96));
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 40px rgba(0,0,0,.28);
+      cursor: pointer;
+      overflow: hidden;
+      transition: transform .15s ease, border-color .15s ease;
+    }
+    .card:hover { transform: translateY(-3px); border-color: rgba(246,196,83,.62); }
+    .card.dead { filter: grayscale(.65); }
+    .avatar-wrap { position: relative; height: 128px; border-radius: 14px; overflow: hidden; background: #0a0e1d; border: 1px solid var(--line); }
+    .avatar { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .red-cross { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; background: rgba(30,0,0,.35); color: var(--danger); font-size: 88px; font-weight: 1000; text-shadow: 0 2px 12px black; }
+    .dead .red-cross { display: flex; }
+    .badge {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      min-width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      color: white;
+      background: #58607b;
+      font-weight: 900;
+      border: 2px solid rgba(255,255,255,.75);
+    }
+    .badge.leading { background: var(--danger); box-shadow: 0 0 18px rgba(255,51,79,.7); }
+    .name { margin-top: 12px; font-size: 18px; font-weight: 800; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .trial-banner { margin-top: 8px; padding: 6px 8px; border-radius: 8px; background: rgba(255,51,79,.15); color: #ffb8c2; font-weight: 800; display:none; }
+    .card.trial .trial-banner { display:block; }
+    .side { display: grid; grid-template-rows: auto 1fr auto; gap: 12px; min-height: calc(100vh - 110px); }
+    .box { background: rgba(21,27,49,.94); border: 1px solid var(--line); border-radius: 18px; padding: 14px; box-shadow: 0 18px 40px rgba(0,0,0,.22); }
+    .title { margin: 0 0 10px; color: var(--accent); font-weight: 900; }
+    .log, .chat { height: 220px; overflow-y: auto; font-size: 13px; line-height: 1.45; color: #dfe6ff; }
+    .chat { height: 260px; }
+    .line { padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.06); }
+    .composer { display:flex; gap: 8px; }
+    input { flex: 1; border: 1px solid var(--line); border-radius: 12px; background: #0d1326; color: var(--text); padding: 12px; outline: none; }
+    button { border: 0; border-radius: 12px; padding: 11px 14px; font-weight: 900; cursor: pointer; color: #101525; background: var(--accent); }
+    button.secondary { background: #3c4666; color: var(--text); }
+    button.danger { background: var(--danger); color: white; }
+    button.safe { background: var(--safe); color: #06140d; }
+    .modal-backdrop { position: fixed; inset: 0; display:none; align-items: center; justify-content: center; background: rgba(0,0,0,.62); z-index: 50; padding: 20px; }
+    .modal-backdrop.open { display:flex; }
+    .modal { width: min(440px, 100%); background: #12182d; border: 1px solid rgba(246,196,83,.35); border-radius: 22px; box-shadow: 0 30px 90px rgba(0,0,0,.55); padding: 18px; }
+    .modal-avatar { width: 100%; height: 180px; object-fit: cover; border-radius: 16px; border: 1px solid var(--line); background: #0a0e1d; }
+    .modal-actions { display:flex; gap: 10px; margin-top: 16px; justify-content: flex-end; }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .grid { grid-template-columns: repeat(2, minmax(130px, 1fr)); } .topbar { grid-template-columns: 1fr auto; } .role-counter { grid-column: 1 / -1; justify-content: flex-start; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="phase" id="phase">Connecting...</div>
+      <div class="sub" id="roleLine">Role: ?</div>
+    </div>
+    <div class="timer" id="timer">--</div>
+    <div class="role-counter" id="roleCounter"></div>
+  </header>
+
+  <main>
+    <section class="grid" id="playerGrid"></section>
+    <aside class="side">
+      <div class="box">
+        <h3 class="title">System Logs</h3>
+        <div class="log" id="systemLog"></div>
+      </div>
+      <div class="box">
+        <h3 class="title">Public Chat</h3>
+        <div class="chat" id="chatLog"></div>
+      </div>
+      <div class="box composer">
+        <input id="chatInput" placeholder="Type accusation, defense, or read..." />
+        <button id="sendBtn">Send</button>
+      </div>
+    </aside>
+  </main>
+
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal">
+      <h2 id="modalTitle">Action</h2>
+      <img id="modalAvatar" class="modal-avatar" alt="target avatar" />
+      <p id="modalText" class="sub"></p>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
+  <script>
+    const HUMAN_ID = 1;
+    let state = null;
+    let selected = null;
+    const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${HUMAN_ID}`);
+
+    const phaseNames = {
+      night: 'Night',
+      day_nomination: 'Day: Nomination',
+      day_trial: 'Day: Trial',
+      finished: 'Finished'
+    };
+
+    function placeholder(label) {
+      const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 260'><rect width='400' height='260' fill='#10172e'/><circle cx='200' cy='100' r='52' fill='#4b5b87'/><path d='M95 245c20-70 190-70 210 0' fill='#4b5b87'/><text x='200' y='36' text-anchor='middle' fill='#f6c453' font-size='24' font-family='Arial'>${label}</text></svg>`;
+      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    }
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'state') {
+        state = msg.state;
+        render();
+      } else if (msg.type === 'system') {
+        addLine('systemLog', msg.text);
+      } else if (msg.type === 'chat') {
+        addLine('chatLog', `P${msg.speaker}: ${msg.text}`);
+      }
+    };
+
+    ws.onopen = () => addLine('systemLog', 'Connected to real-time server.');
+    ws.onclose = () => addLine('systemLog', 'Disconnected. Refresh to reconnect.');
+
+    function send(payload) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+    }
+
+    function render() {
+      if (!state) return;
+      document.getElementById('phase').textContent = phaseNames[state.phase] || state.phase;
+      document.getElementById('timer').textContent = state.timer;
+      document.getElementById('roleLine').textContent = `You are P${state.human_id} — ${state.human_role}`;
+      renderRoles();
+      renderPlayers();
+      renderLogs();
+    }
+
+    function renderRoles() {
+      const box = document.getElementById('roleCounter');
+      box.innerHTML = '';
+      Object.entries(state.role_counter).sort().forEach(([role, count]) => {
+        const pill = document.createElement('div');
+        pill.className = 'role-pill';
+        pill.textContent = `${role}: ${count}`;
+        box.appendChild(pill);
+      });
+    }
+
+    function renderPlayers() {
+      const grid = document.getElementById('playerGrid');
+      grid.innerHTML = '';
+      state.players.forEach((p) => {
+        const card = document.createElement('article');
+        card.className = `card ${p.alive ? '' : 'dead'} ${state.trial_target === p.id ? 'trial' : ''}`;
+        card.onclick = () => openModal(p);
+        const avatar = `/static/${p.avatar}`;
+        card.innerHTML = `
+          <div class="badge ${p.is_leading ? 'leading' : ''}">${p.vote_count}</div>
+          <div class="avatar-wrap">
+            <img class="avatar" src="${avatar}" onerror="this.src=placeholder('P${p.id}')" alt="${p.name}" />
+            <div class="red-cross">✕</div>
+          </div>
+          <div class="name">${p.name} <span class="sub">P${p.id}</span></div>
+          <div class="sub">${p.alive ? 'Alive' : 'Dead'}${p.revealed_role ? ' · ' + p.revealed_role : ''} · Stress ${p.stress}</div>
+          <div class="trial-banner">ON TRIAL</div>`;
+        grid.appendChild(card);
+      });
+    }
+
+    function renderLogs() {
+      const log = document.getElementById('systemLog');
+      log.innerHTML = '';
+      state.logs.forEach((line) => addLine('systemLog', line, false));
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function addLine(id, text, scroll = true) {
+      const box = document.getElementById(id);
+      const div = document.createElement('div');
+      div.className = 'line';
+      div.textContent = text;
+      box.appendChild(div);
+      if (scroll) box.scrollTop = box.scrollHeight;
+    }
+
+    function openModal(player) {
+      if (!state || !player.alive || player.id === HUMAN_ID) return;
+      selected = player;
+      document.getElementById('modalTitle').textContent = titleFor(player);
+      document.getElementById('modalText').textContent = textFor(player);
+      const modalAvatar = document.getElementById('modalAvatar');
+      modalAvatar.src = `/static/${player.avatar}`;
+      modalAvatar.onerror = () => { modalAvatar.src = placeholder(`P${player.id}`); };
+      const actions = document.getElementById('modalActions');
+      actions.innerHTML = '';
+      actionButtons(player).forEach(([label, cls, fn]) => {
+        const button = document.createElement('button');
+        button.textContent = label;
+        button.className = cls;
+        button.onclick = fn;
+        actions.appendChild(button);
+      });
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Cancel';
+      cancel.className = 'secondary';
+      cancel.onclick = closeModal;
+      actions.appendChild(cancel);
+      document.getElementById('modalBackdrop').classList.add('open');
+    }
+
+    function titleFor(player) {
+      if (state.phase === 'day_nomination') return `Nominate ${player.name}?`;
+      if (state.phase === 'day_trial') return `Target is on trial!`;
+      if (state.phase === 'night') return `Night action: ${player.name}`;
+      return player.name;
+    }
+
+    function textFor(player) {
+      if (state.phase === 'day_nomination') return `Vote to put P${player.id} on trial.`;
+      if (state.phase === 'day_trial') return `Trial target: P${state.trial_target}. Decide Guilty or Acquit.`;
+      if (state.phase === 'night') return `Your role is ${state.human_role}. Citizens have no night action.`;
+      return '';
+    }
+
+    function actionButtons(player) {
+      if (state.phase === 'day_nomination') {
+        return [['Vote', 'danger', () => { send({type:'nominate', target_id: player.id}); closeModal(); }]];
+      }
+      if (state.phase === 'day_trial' && state.trial_target === player.id) {
+        return [
+          ['Guilty', 'danger', () => { send({type:'trial_vote', verdict:'guilty'}); closeModal(); }],
+          ['Acquit', 'safe', () => { send({type:'trial_vote', verdict:'innocent'}); closeModal(); }]
+        ];
+      }
+      if (state.phase === 'night') {
+        if (['Mafia','Boss'].includes(state.human_role)) return [['Kill', 'danger', () => { send({type:'night_action', target_id: player.id}); closeModal(); }]];
+        if (state.human_role === 'Cop') return [['Investigate', '', () => { send({type:'night_action', target_id: player.id}); closeModal(); }]];
+        if (state.human_role === 'Doc') return [['Heal', 'safe', () => { send({type:'night_action', target_id: player.id}); closeModal(); }]];
+      }
+      return [];
+    }
+
+    function closeModal() { document.getElementById('modalBackdrop').classList.remove('open'); }
+    document.getElementById('modalBackdrop').onclick = (e) => { if (e.target.id === 'modalBackdrop') closeModal(); };
+    document.getElementById('sendBtn').onclick = () => sendChat();
+    document.getElementById('chatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+    function sendChat() {
+      const input = document.getElementById('chatInput');
+      const text = input.value.trim();
+      if (!text) return;
+      send({type:'chat', text});
+      input.value = '';
+    }
+  </script>
+</body>
+</html>
