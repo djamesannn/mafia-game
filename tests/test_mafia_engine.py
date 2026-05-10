@@ -45,6 +45,14 @@ class FakeEvaluator:
         return f"P{bot.bot_id} is nervous but watching the room."
 
 
+class FailingEvaluator:
+    async def evaluate_chat_message(self, speaker_id, text, listeners_context):
+        raise RuntimeError("llm unavailable")
+
+    async def generate_bot_chat(self, bot, public_context):
+        return "unreachable"
+
+
 class MafiaEngineTests(unittest.TestCase):
     def test_first_impression_initializes_all_matrix_entries(self) -> None:
         state = build_demo_state(seed=11)
@@ -95,6 +103,26 @@ class MafiaEngineTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+
+
+    def test_chat_batch_logs_llm_exception_without_raising(self) -> None:
+        async def scenario() -> None:
+            state = build_demo_state(seed=25)
+            router = NeurosymbolicRouter(state, evaluator=FailingEvaluator())
+            await router.enqueue_chat(4, "this will fail", visible_to=[5])
+            await router.process_chat_batch()
+            self.assertTrue(any("LLM chat evaluation failed" in event for event in state.event_log))
+
+        asyncio.run(scenario())
+
+    def test_bot_chat_truncates_at_sentence_boundary(self) -> None:
+        long_text = "I suspect P2 because the timing is strange. " + "Extra words " * 40
+        truncated = LlamaJSONEvaluator._truncate_at_sentence_boundary(long_text, limit=80)
+        self.assertEqual(truncated, "I suspect P2 because the timing is strange.")
+
+        no_punctuation = "word " * 40
+        truncated_no_punctuation = LlamaJSONEvaluator._truncate_at_sentence_boundary(no_punctuation, limit=40)
+        self.assertTrue(truncated_no_punctuation.endswith("..."))
 
     def test_profiles_json_loads_persistent_identities(self) -> None:
         profiles = load_bot_profiles()

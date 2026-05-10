@@ -18,6 +18,8 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from starlette.websockets import WebSocketState
+from websockets.exceptions import ConnectionClosed
 
 from mafia_engine import (
     DAY_NOMINATION_DURATION_SECONDS,
@@ -40,6 +42,8 @@ from mafia_engine import (
 
 HUMAN_ID: PlayerId = 1
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
+
+
 class LazyLlamaEvaluator:
     """Defers Qwen GGUF loading until first chat/generation request."""
 
@@ -86,9 +90,12 @@ class ConnectionManager:
         target_ids = recipients if recipients is not None else set(self.active)
         for player_id in target_ids:
             for websocket in list(self.active.get(player_id, set())):
+                if websocket.client_state is not WebSocketState.CONNECTED:
+                    stale.append((player_id, websocket))
+                    continue
                 try:
                     await websocket.send_json(payload)
-                except RuntimeError:
+                except (WebSocketDisconnect, ConnectionClosed, RuntimeError):
                     stale.append((player_id, websocket))
         for player_id, websocket in stale:
             self.disconnect(websocket, player_id)
@@ -105,6 +112,7 @@ class WebMafiaGame:
         self.nomination_votes: dict[PlayerId, PlayerId] = {}
         self.trial_votes: dict[PlayerId, str] = {}
         self.chat_tasks: set[asyncio.Task[Any]] = set()
+        self.bot_action_tasks: set[asyncio.Task[Any]] = set()
         self.phase_task: asyncio.Task[Any] | None = None
         self._lock = asyncio.Lock()
 
@@ -166,20 +174,27 @@ class WebMafiaGame:
         self.phase_deadline = time.monotonic() + NIGHT_DURATION_SECONDS
         await self.broadcast_state("Night is passing...")
 
+        bot_tasks = self.schedule_bot_night_actions()
         start = time.monotonic()
         human = self.state.bots[HUMAN_ID]
         human_is_mafia = human.is_alive and human.team is Team.MAFIA
+        buffered = False
         while True:
             elapsed = time.monotonic() - start
-            await self._drain_chat_nonblocking()
+            await self._drain_background_tasks()
             await self.broadcast_state()
+            bot_actions_done = all(task.done() for task in bot_tasks)
             if human_is_mafia:
                 has_intent = self.router.intent_to_kill is not None
-                if elapsed >= 10.0 and has_intent:
-                    break
-                if elapsed >= 15.0:
-                    break
-            elif elapsed >= 3.0:
+                ready = (elapsed >= 10.0 and has_intent and bot_actions_done) or elapsed >= 15.0
+            else:
+                ready = elapsed >= 3.0 and bot_actions_done
+            if ready:
+                if not buffered:
+                    await self.suspense_buffer("Night actions are locked in...")
+                    buffered = True
+                break
+            if time.monotonic() >= self.phase_deadline:
                 break
             await asyncio.sleep(1.0)
 
@@ -200,12 +215,18 @@ class WebMafiaGame:
         self.state.phase = Phase.DAY_NOMINATION
         self.phase_deadline = time.monotonic() + DAY_NOMINATION_DURATION_SECONDS
         await self.broadcast_state("Day nomination started. Choose a player to nominate.")
-        await asyncio.sleep(1.0)
-        await self.cast_bot_nominations()
+        bot_tasks = self.schedule_bot_nominations()
+        buffered = False
         while time.monotonic() < self.phase_deadline and self.state.phase is Phase.DAY_NOMINATION:
-            await self._drain_chat_nonblocking()
+            await self._drain_background_tasks()
             await self.broadcast_state()
+            if self.nomination_actions_complete(bot_tasks):
+                if not buffered:
+                    await self.suspense_buffer("All nomination votes are in...")
+                    buffered = True
+                break
             await asyncio.sleep(1.0)
+        self.cancel_pending_tasks(bot_tasks)
         self.finalize_nomination()
         await self.broadcast_state(f"P{self.state.trial_target} is on trial." if self.state.trial_target else "No trial target.")
 
@@ -213,36 +234,121 @@ class WebMafiaGame:
         self.state.phase = Phase.DAY_TRIAL
         self.phase_deadline = time.monotonic() + DAY_TRIAL_DURATION_SECONDS
         await self.broadcast_state("Trial started. Vote Guilty or Acquit.")
-        await asyncio.sleep(1.0)
-        await self.cast_bot_trial_votes()
+        bot_tasks = self.schedule_bot_trial_votes()
+        buffered = False
         while time.monotonic() < self.phase_deadline and self.state.phase is Phase.DAY_TRIAL:
-            await self._drain_chat_nonblocking()
+            await self._drain_background_tasks()
             await self.broadcast_state()
+            if self.trial_actions_complete(bot_tasks):
+                if not buffered:
+                    await self.suspense_buffer("All trial votes are in...")
+                    buffered = True
+                break
             await asyncio.sleep(1.0)
+        self.cancel_pending_tasks(bot_tasks)
         exiled = self.finalize_trial()
         if exiled is None:
             await self.broadcast_state("Trial ended with an acquittal.")
         else:
             await self.broadcast_state(f"P{exiled} was exiled and revealed as {self.state.bots[exiled].role.value}.")
 
-    async def cast_bot_nominations(self) -> None:
-        async with self._lock:
-            for bot in self.state.alive_bots():
-                if bot.bot_id == HUMAN_ID or bot.is_frozen or bot.bot_id in self.nomination_votes:
-                    continue
-                target = self.router._select_day_vote_target(bot)
-                if target is not None:
-                    self._record_nomination(bot.bot_id, target)
+    def schedule_bot_night_actions(self) -> set[asyncio.Task[Any]]:
+        tasks: set[asyncio.Task[Any]] = set()
+        for bot in self.state.alive_bots():
+            if bot.bot_id == HUMAN_ID:
+                continue
+            if bot.team is Team.MAFIA or bot.role in {Role.COP, Role.DOC, Role.MANIAC, Role.WITNESS}:
+                task = asyncio.create_task(self.bot_night_action_after_delay(bot.bot_id))
+                self.bot_action_tasks.add(task)
+                tasks.add(task)
+                task.add_done_callback(self.bot_action_tasks.discard)
+        return tasks
 
-    async def cast_bot_trial_votes(self) -> None:
+    def schedule_bot_nominations(self) -> set[asyncio.Task[Any]]:
+        tasks: set[asyncio.Task[Any]] = set()
+        for bot in self.state.alive_bots():
+            if bot.bot_id == HUMAN_ID or bot.is_frozen:
+                continue
+            task = asyncio.create_task(self.bot_nomination_after_delay(bot.bot_id))
+            self.bot_action_tasks.add(task)
+            tasks.add(task)
+            task.add_done_callback(self.bot_action_tasks.discard)
+        return tasks
+
+    def schedule_bot_trial_votes(self) -> set[asyncio.Task[Any]]:
+        tasks: set[asyncio.Task[Any]] = set()
+        target_id = self.state.trial_target
+        if target_id is None:
+            return tasks
+        for bot in self.state.alive_bots():
+            if bot.bot_id in {HUMAN_ID, target_id}:
+                continue
+            task = asyncio.create_task(self.bot_trial_vote_after_delay(bot.bot_id))
+            self.bot_action_tasks.add(task)
+            tasks.add(task)
+            task.add_done_callback(self.bot_action_tasks.discard)
+        return tasks
+
+    async def bot_night_action_after_delay(self, bot_id: PlayerId) -> None:
+        bot = self.state.bots[bot_id]
+        await asyncio.sleep(self.bot_action_delay(bot))
+        async with self._lock:
+            if self.state.phase is not Phase.NIGHT or not bot.is_alive:
+                return
+            if bot.team is Team.MAFIA:
+                target_id = self.router._select_mafia_consensus_target()
+                if target_id is not None:
+                    self.router.set_intent_to_kill(target_id, time.monotonic(), actor_id=bot_id)
+                    self.state.event_log.append(f"P{bot_id} quietly marked P{target_id} as a night target")
+            elif bot.role in {Role.COP, Role.DOC, Role.MANIAC, Role.WITNESS}:
+                self.state.event_log.append(f"P{bot_id} prepared a night action")
+
+    async def bot_nomination_after_delay(self, bot_id: PlayerId) -> None:
+        bot = self.state.bots[bot_id]
+        await asyncio.sleep(self.bot_action_delay(bot))
+        async with self._lock:
+            if self.state.phase is not Phase.DAY_NOMINATION or not bot.is_alive or bot.is_frozen or bot_id in self.nomination_votes:
+                return
+            target = self.router._select_day_vote_target(bot)
+            if target is not None:
+                self._record_nomination(bot_id, target)
+
+    async def bot_trial_vote_after_delay(self, bot_id: PlayerId) -> None:
+        bot = self.state.bots[bot_id]
+        await asyncio.sleep(self.bot_action_delay(bot))
         async with self._lock:
             target_id = self.state.trial_target
-            if target_id is None:
+            if self.state.phase is not Phase.DAY_TRIAL or target_id is None or not bot.is_alive or bot_id in self.trial_votes:
                 return
-            for bot in self.state.alive_bots():
-                if bot.bot_id in {HUMAN_ID, target_id} or bot.bot_id in self.trial_votes:
-                    continue
-                self._record_trial_vote(bot.bot_id, self.router._select_trial_vote(bot, target_id))
+            if bot_id == target_id:
+                return
+            self._record_trial_vote(bot_id, self.router._select_trial_vote(bot, target_id))
+
+    def bot_action_delay(self, bot: MafiaBot) -> float:
+        if bot.stress_level > 0.4:
+            return self.state.rng.uniform(5.0, 25.0)
+        return self.state.rng.uniform(1.0, 15.0)
+
+    async def suspense_buffer(self, message: str) -> None:
+        self.state.event_log.append(message)
+        await self.broadcast_state(message)
+        await asyncio.sleep(self.state.rng.uniform(3.0, 5.0))
+
+    def nomination_actions_complete(self, bot_tasks: set[asyncio.Task[Any]]) -> bool:
+        expected = {bot.bot_id for bot in self.state.alive_bots() if not bot.is_frozen}
+        return expected.issubset(self.nomination_votes) and all(task.done() for task in bot_tasks)
+
+    def trial_actions_complete(self, bot_tasks: set[asyncio.Task[Any]]) -> bool:
+        target_id = self.state.trial_target
+        if target_id is None:
+            return True
+        expected = {bot.bot_id for bot in self.state.alive_bots() if bot.bot_id != target_id}
+        return expected.issubset(self.trial_votes) and all(task.done() for task in bot_tasks)
+
+    def cancel_pending_tasks(self, tasks: set[asyncio.Task[Any]]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
     def finalize_nomination(self) -> None:
         self.router.last_day_votes = self.nomination_votes.copy()
@@ -357,10 +463,11 @@ class WebMafiaGame:
         await self.router.process_chat_batch()
         await self.broadcast_state("Psychological chat deltas applied.")
 
-    async def _drain_chat_nonblocking(self) -> None:
-        if self.chat_tasks:
-            done = {task for task in self.chat_tasks if task.done()}
-            self.chat_tasks -= done
+    async def _drain_background_tasks(self) -> None:
+        for task_set in (self.chat_tasks, self.bot_action_tasks):
+            if task_set:
+                done = {task for task in task_set if task.done()}
+                task_set -= done
 
     def _finish_or_set(self, next_phase: Phase) -> bool:
         winner = self.router.check_win_condition()
@@ -425,13 +532,25 @@ class WebMafiaGame:
         return {target_id for target_id, count in counts.items() if count == top and top > 0}
 
 
-game = WebMafiaGame()
+class RoomManager:
+    """Owns independent game sessions keyed by room id."""
+
+    def __init__(self) -> None:
+        self.games: dict[str, WebMafiaGame] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_game(self, room_id: str) -> WebMafiaGame:
+        async with self._lock:
+            game = self.games.get(room_id)
+            if game is None:
+                game = WebMafiaGame()
+                self.games[room_id] = game
+            game.start()
+            return game
+
+
+room_manager = RoomManager()
 app = FastAPI(title="Neurosymbolic Mafia")
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    game.start()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -439,13 +558,14 @@ async def index() -> str:
     return TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-@app.websocket("/ws/{player_id}")
-async def websocket_endpoint(websocket: WebSocket, player_id: int) -> None:
+@app.websocket("/ws/{room_id}/{player_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int) -> None:
+    game = await room_manager.get_game(room_id)
     await game.manager.connect(websocket, player_id)
-    await websocket.send_json({"type": "state", "state": game.snapshot()})
     try:
+        await websocket.send_json({"type": "state", "state": game.snapshot()})
         while True:
             message = await websocket.receive_json()
             await game.handle_action(player_id, message)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, ConnectionClosed, RuntimeError):
         game.manager.disconnect(websocket, player_id)

@@ -12,7 +12,7 @@ The engine uses a strict **Fast Path / Slow Path** split:
 ## Main modules
 
 - `mafia_engine.py` defines bot state, persistent profile loading, matrices, deterministic event routing, role target selection, asynchronous channel chat batching, trial-phase voting, and the `LlamaJSONEvaluator`.
-- `server.py` runs the FastAPI/WebSocket game server with non-blocking timers, live nomination/trial voting, night intent coordination, general/mafia chat routing, and broadcast state snapshots.
+- `server.py` runs the FastAPI/WebSocket game server with non-blocking timers, multi-room session management, human-like bot action delays, phase suspense buffers, night intent coordination, general/mafia chat routing, and broadcast state snapshots.
 - `templates/index.html` is the vanilla JS/CSS browser UI with production-style top bar, central system banners/action panel, right player sidebar, chat tabs, and night-intent badges.
 - `profiles.json` contains persistent Russian/English bot identities, avatar bases, genders, and psychotypes sampled into each game.
 - `play_cli.py` keeps a simple terminal loop for quick local experiments.
@@ -36,7 +36,7 @@ pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-Open <http://localhost:8000>. Player 1 is the human player in the prototype.
+Open <http://localhost:8000> for the default `lobby` room, or pass `?room=my-room` to create/join another independent room. Player 1 is the human player in the prototype.
 
 ## Development checks
 

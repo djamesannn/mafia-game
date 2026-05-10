@@ -29,7 +29,7 @@
   <aside class="sidebar"><div class="side-title"><span>Players</span><span id="roleLine">Role: ?</span></div><div class="players" id="players"></div><div class="logs" id="logs"></div></aside>
 </main>
 <script>
-const HUMAN_ID=1;let state=null;let activeChannel='general';let selected=null;const wsProtocol=location.protocol==='https:'?'wss:':'ws:';const ws=new WebSocket(`${wsProtocol}//${location.host}/ws/${HUMAN_ID}`);
+const HUMAN_ID=1;let state=null;let activeChannel='general';let selected=null;const wsProtocol=location.protocol==='https:'?'wss:':'ws:';const roomId=new URLSearchParams(location.search).get('room')||'lobby';const ws=new WebSocket(`${wsProtocol}//${location.host}/ws/${roomId}/${HUMAN_ID}`);
 const phaseNames={night:'NIGHT',day_nomination:'DAY NOMINATION',day_trial:'TRIAL',finished:'GAME OVER'};
 function placeholder(label){const svg=`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 220 180'><rect width='220' height='180' fill='#101728'/><circle cx='110' cy='70' r='36' fill='#536184'/><path d='M45 170c18-56 112-56 130 0' fill='#536184'/><text x='110' y='25' text-anchor='middle' fill='#f2c14e' font-size='18' font-family='Arial'>${label}</text></svg>`;return'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg)}
 function send(payload){if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(payload))}

@@ -436,7 +436,24 @@ class LlamaJSONEvaluator:
             temperature=0.7,
             max_tokens=48,
         )
-        return str(raw["choices"][0]["message"]["content"]).strip().replace("\n", " ")[:180]
+        text = str(raw["choices"][0]["message"]["content"]).strip().replace("\n", " ")
+        return self._truncate_at_sentence_boundary(text)
+
+    @staticmethod
+    def _truncate_at_sentence_boundary(text: str, limit: int = 180) -> str:
+        """Trim generated bot text near `limit` without cutting mid-sentence when possible."""
+
+        if len(text) <= limit:
+            return text
+        window = text[: limit + 1]
+        punctuation_positions = [window.rfind(mark) for mark in (".", "!", "?")]
+        boundary = max(punctuation_positions)
+        if boundary >= 0:
+            return window[: boundary + 1].strip()
+        space = window.rfind(" ")
+        if space >= 0:
+            return window[:space].rstrip() + "..."
+        return window[:limit].rstrip() + "..."
 
     def _build_prompt(self, speaker_id: PlayerId, text: str, listeners_context: Mapping[str, Any]) -> str:
         return (
@@ -537,7 +554,12 @@ class NeurosymbolicRouter:
             return
 
         tasks = [self._evaluate_one_message(message) for message in batch]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for message, result in zip(batch, results):
+            if isinstance(result, Exception):
+                self.state.event_log.append(
+                    f"LLM chat evaluation failed for speaker {message.speaker_id} in {message.channel} chat: {result}"
+                )
 
     async def _evaluate_one_message(self, message: ChatMessage) -> None:
         context = {"speaker_id": message.speaker_id, "alive_target_ids": list(message.visible_to), "channel": message.channel}
